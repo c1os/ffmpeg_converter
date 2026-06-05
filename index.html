@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ffmpeg_converter</title>
+  </head>
+  <body>
+    <div id="converter-root"></div>
+
+    <script type="module">
+      import { setupConverter } from '/src/ffmpeg_converter.js'
+
+      const root = document.getElementById('converter-root') || document.body
+
+      ;(async () => {
+        try {
+          await setupConverter(root)
+        } catch (e) {
+          console.error('Converter init error', e)
+          root.innerText = 'Error initializing converter: ' + (e && e.message ? e.message : String(e))
+        }
+      })()
+    </script>
+  </body>
+</html>
