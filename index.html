@@ -1,26 +1,157 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" class="bg-bg">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ffmpeg_converter</title>
+    <meta
+      name="description"
+      content="Convert short videos to WebM, WebP, or GIF entirely in your browser. No uploads, no backend."
+    />
+    <title>Local Video Converter — WebM / WebP / GIF</title>
+    <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
-    <div id="converter-root"></div>
+    <main class="app">
+      <header class="app__header">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true"></span>
+          <h1 class="brand__title">Local Video Converter</h1>
+        </div>
+        <p class="app__tagline">
+          Convert <code>.mov</code> and <code>.mp4</code> clips to
+          <strong>WebM</strong>, <strong>WebP</strong>, or <strong>GIF</strong>
+         
+        </p>
+        <p id="engine-status" class="engine-status" role="status" aria-live="polite">
+          <span class="engine-status__dot" data-state="loading"></span>
+          <span id="engine-status-text">Loading conversion engine…</span>
+        </p>
+      </header>
 
-    <script type="module">
-      import { setupConverter } from '/src/ffmpeg_converter.js'
+      <section class="layout">
+        <!-- Left: drop + file list -->
+        <div class="panel panel--files">
+          <div
+            id="dropzone"
+            class="dropzone"
+            tabindex="0"
+            role="button"
+            aria-label="Drop videos here or click to browse"
+          >
+            <input
+              id="file-input"
+              type="file"
+              accept="video/mp4,video/quicktime,.mp4,.mov"
+              multiple
+              hidden
+            />
+            <svg class="dropzone__icon" viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
+              <path
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d="M12 16V4m0 0L8 8m4-4 4 4M4 14v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"
+              />
+            </svg>
+            <p class="dropzone__title">Drag &amp; drop videos here</p>
+            <p class="dropzone__hint">or click to browse — multiple <code>.mov</code> / <code>.mp4</code> files supported</p>
+          </div>
 
-      const root = document.getElementById('converter-root') || document.body
+          <div class="filelist__head">
+            <h2 class="panel__title">Files</h2>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button id="clear-btn" class="btn btn--ghost" type="button" disabled>Clear all</button>
+              <button id="download-all-btn" class="btn btn--primary" type="button" disabled>Download all (zip)</button>
+            </div>
+          </div>
+          <ul id="filelist" class="filelist" aria-live="polite"></ul>
+          <p id="empty-state" class="empty-state">No files added yet.</p>
+        </div>
 
-      ;(async () => {
-        try {
-          await setupConverter(root)
-        } catch (e) {
-          console.error('Converter init error', e)
-          root.innerText = 'Error initializing converter: ' + (e && e.message ? e.message : String(e))
-        }
-      })()
-    </script>
+        <!-- Right: settings + actions -->
+        <aside class="panel panel--settings">
+          <h2 class="panel__title">Export settings</h2>
+
+          <div class="field">
+            <label class="field__label">Output format</label>
+            <div class="segmented" role="radiogroup" aria-label="Output format">
+              <label class="segmented__opt">
+                <input type="radio" name="format" value="webm" checked />
+                <span>WebM</span>
+              </label>
+              <label class="segmented__opt">
+                <input type="radio" name="format" value="webp" />
+                <span>WebP</span>
+              </label>
+              <label class="segmented__opt">
+                <input type="radio" name="format" value="gif" />
+                <span>GIF</span>
+              </label>
+            </div>
+            <p id="format-desc" class="field__desc"></p>
+          </div>
+
+          <div class="field">
+            <label class="toggle">
+              <input type="checkbox" id="alpha-toggle" />
+              <span class="toggle__track"><span class="toggle__thumb"></span></span>
+              <span class="toggle__label">
+                Preserve transparency (alpha)
+                <small id="alpha-note" class="toggle__note"></small>
+              </span>
+            </label>
+          </div>
+
+          <div class="field">
+            <div class="field__row">
+              <label class="field__label" for="fps">Frame rate</label>
+              <output id="fps-out" class="field__value">15 fps</output>
+            </div>
+            <input type="range" id="fps" min="5" max="30" step="1" value="15" />
+          </div>
+
+          <div class="field">
+            <div class="field__row">
+              <label class="field__label" for="quality">
+                <span id="quality-label">Quality</span>
+              </label>
+              <output id="quality-out" class="field__value"></output>
+            </div>
+            <input type="range" id="quality" min="0" max="100" step="1" value="75" />
+            <p class="field__desc">Higher = better looking, larger file.</p>
+          </div>
+
+          <div class="field">
+            <div class="field__row">
+              <label class="field__label" for="width">Max width</label>
+              <output id="width-out" class="field__value">Original</output>
+            </div>
+            <input type="range" id="width" min="0" max="1920" step="80" value="0" />
+            <p class="field__desc">Scales down keeping aspect ratio. 0 = keep original.</p>
+          </div>
+
+          <div class="field">
+            <label class="toggle">
+              <input type="checkbox" id="loop-toggle" checked />
+              <span class="toggle__track"><span class="toggle__thumb"></span></span>
+              <span class="toggle__label">Loop forever</span>
+            </label>
+          </div>
+
+          <button id="convert-btn" class="btn btn--primary btn--block" type="button" disabled>
+            Convert all files
+          </button>
+        </aside>
+      </section>
+
+      <footer class="app__footer">
+        Powered by <a href="https://github.com/ffmpegwasm/ffmpeg.wasm" target="_blank" rel="noreferrer">ffmpeg.wasm</a>.
+        All processing runs locally in your browser.
+      </footer>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
   </body>
 </html>

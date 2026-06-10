@@ -1,6 +1,6 @@
 {
-  "name": "ffmpeg_converter",
-  "version": "0.0.0",
+  "name": "video-converter-wasm",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,11 +8,12 @@
     "build": "vite build",
     "preview": "vite preview"
   },
-  "devDependencies": {
-    "vite": "^8.0.12"
-  },
   "dependencies": {
-    "@ffmpeg/ffmpeg": "^0.11.6",
-    "@ffmpeg/util": "^0.12.2"
+    "@ffmpeg/ffmpeg": "^0.12.10",
+    "@ffmpeg/util": "^0.12.1",
+    "jszip": "^3.10.1"
+  },
+  "devDependencies": {
+    "vite": "^5.4.10"
   }
 }

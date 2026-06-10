@@ -1,39 +1,592 @@
-import './style.css'
-import javascriptLogo from './assets/javascript.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import { setupCounter } from './counter.js'
-import { setupConverter } from './ffmpeg_converter.js'
+import { FFmpeg } from "@ffmpeg/ffmpeg"
+import { fetchFile, toBlobURL } from "@ffmpeg/util"
+import JSZip from "jszip"
 
-document.querySelector('#app').innerHTML = `
-<section id="center">
-  <div class="hero">
-    <img src="${heroImg}" class="base" width="170" height="179">
-    <img src="${javascriptLogo}" class="framework" alt="JavaScript logo"/>
-    <img src="${viteLogo}" class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/main.js</code> and save to test <code>HMR</code></p>
-  </div>
-  <button id="counter" type="button" class="counter"></button>
-</section>
+// ---------------------------------------------------------------------------
+// Format definitions
+// ---------------------------------------------------------------------------
+const FORMATS = {
+  webm: {
+    ext: "webm",
+    mime: "video/webm",
+    label: "WebM",
+    supportsAlpha: true,
+    qualityLabel: "Quality (CRF)",
+    desc: "VP9 video. Best quality-to-size and supports transparency.",
+    alphaNote: "VP9 keeps the alpha channel if the source has one.",
+  },
+  webp: {
+    ext: "webp",
+    mime: "image/webp",
+    label: "Animated WebP",
+    supportsAlpha: true,
+    qualityLabel: "Quality",
+    desc: "Animated WebP image. Great for the web, supports transparency.",
+    alphaNote: "Transparent pixels are preserved if present in the source.",
+  },
+  gif: {
+    ext: "gif",
+    mime: "image/gif",
+    label: "GIF",
+    supportsAlpha: false,
+    qualityLabel: "Colors (palette)",
+    desc: "Classic animated GIF. Universally supported, larger files.",
+    alphaNote: "GIF can't store smooth transparency — disabled.",
+  },
+}
 
-<div class="ticks"></div>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let ffmpeg = null
+let engineReady = false
+let engineLoading = false
+let enginePromise = null
+let isConverting = false
+const files = [] // { id, file, status, progress, results: [{url, name, size}], error }
+let idCounter = 0
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#documentation-icon"></use></svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-  </div>
-</section>
+// ---------------------------------------------------------------------------
+// Element refs
+// ---------------------------------------------------------------------------
+const $ = (sel) => document.querySelector(sel)
+const dropzone = $("#dropzone")
+const fileInput = $("#file-input")
+const fileListEl = $("#filelist")
+const emptyState = $("#empty-state")
+const clearBtn = $("#clear-btn")
+const convertBtn = $("#convert-btn")
+const statusDot = $("#engine-status .engine-status__dot")
+const statusText = $("#engine-status-text")
+const downloadAllBtn = $("#download-all-btn")
 
-<div class="ticks"></div>
-<section id="spacer"></section>
-`
+const alphaToggle = $("#alpha-toggle")
+const alphaNote = $("#alpha-note")
+const loopToggle = $("#loop-toggle")
+const fpsInput = $("#fps")
+const fpsOut = $("#fps-out")
+const qualityInput = $("#quality")
+const qualityOut = $("#quality-out")
+const qualityLabel = $("#quality-label")
+const widthInput = $("#width")
+const widthOut = $("#width-out")
+const formatDesc = $("#format-desc")
 
-setupCounter(document.querySelector('#counter'))
+const getFormat = () => document.querySelector('input[name="format"]:checked').value
 
-// Initialize the ffmpeg converter UI below the main app
-setupConverter(document.querySelector('#app'))
+// ---------------------------------------------------------------------------
+// FFmpeg engine bootstrap (lazy — only loads on first conversion)
+//
+// We prefer the SINGLE-THREAD core (@ffmpeg/core) when the page is not
+// cross-origin isolated. The multi-thread core (@ffmpeg/core-mt) provides
+// much better performance but requires `crossOriginIsolated === true`
+// (COOP/COEP headers) and uses a worker/SharedArrayBuffer.
+//
+// Per the ffmpeg.wasm docs, Vite users should use the `esm` build for the
+// single-thread core and the `umd` build for the multi-thread core worker files.
+// ---------------------------------------------------------------------------
+const CORE_VERSION = "0.12.10"
+const CORE_SINGLE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/esm`
+const CORE_MULTI = `https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@${CORE_VERSION}/dist/umd`
+
+// runtime detection: only enable multi-thread when crossOriginIsolated is true
+let useMultiThread = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated === true
+
+// Set to `true` to eagerly load the engine on page load (costly; ~30MB)
+const EAGER_LOAD = false
+
+function setEngineStatus(state, text) {
+  statusDot.dataset.state = state
+  statusText.textContent = text
+}
+
+async function loadEngine() {
+  if (engineReady) return true
+  if (enginePromise) return enginePromise
+
+  engineLoading = true
+  setEngineStatus("loading", "Loading conversion engine…")
+  refreshControls()
+
+  enginePromise = (async () => {
+    const CORE_BASE = useMultiThread ? CORE_MULTI : CORE_SINGLE
+    console.log("[v0] ffmpeg core:", useMultiThread ? "core-mt (multi-thread)" : "core (single-thread)")
+
+    ffmpeg = new FFmpeg()
+    ffmpeg.on("log", ({ message }) => console.log("[v0][ffmpeg]", message))
+
+    if (useMultiThread) {
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+        wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+        workerURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.worker.js`, "text/javascript"),
+      })
+    } else {
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+        wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+      })
+    }
+
+    engineReady = true
+    engineLoading = false
+    setEngineStatus("ready", "Conversion engine ready")
+    refreshControls()
+    return true
+  })()
+
+  try {
+    return await enginePromise
+  } catch (err) {
+    console.log("[v0] engine load failed:", err)
+    engineLoading = false
+    enginePromise = null
+    setEngineStatus("error", "Couldn't load the engine. Check your connection and try Convert again.")
+    refreshControls()
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File handling
+// ---------------------------------------------------------------------------
+const ACCEPTED = /\.(mp4|mov)$/i
+const ACCEPTED_MIME = ["video/mp4", "video/quicktime"]
+
+function isAccepted(file) {
+  return ACCEPTED.test(file.name) || ACCEPTED_MIME.includes(file.type)
+}
+
+function addFiles(fileList) {
+  let added = 0
+  for (const file of fileList) {
+    if (!isAccepted(file)) continue
+    // de-dupe by name + size
+    if (files.some((f) => f.file.name === file.name && f.file.size === file.size)) continue
+    files.push({
+      id: ++idCounter,
+      file,
+      status: "queued",
+      progress: 0,
+      results: [],
+      error: null,
+    })
+    added++
+  }
+  if (added === 0 && fileList.length > 0) {
+    flashDropzone("No supported .mp4 / .mov files found")
+  }
+  render()
+}
+
+function removeFile(id) {
+  const idx = files.findIndex((f) => f.id === id)
+  if (idx === -1) return
+  files[idx].results.forEach((r) => URL.revokeObjectURL(r.url))
+  files.splice(idx, 1)
+  render()
+}
+
+function clearAll() {
+  files.forEach((f) => f.results.forEach((r) => URL.revokeObjectURL(r.url)))
+  files.length = 0
+  render()
+}
+
+function flashDropzone(msg) {
+  const orig = dropzone.querySelector(".dropzone__hint").textContent
+  const hint = dropzone.querySelector(".dropzone__hint")
+  hint.textContent = msg
+  setTimeout(() => (hint.textContent = orig), 2200)
+}
+
+// ---------------------------------------------------------------------------
+// Conversion
+// ---------------------------------------------------------------------------
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function buildVideoFilters() {
+  const filters = []
+  const fps = parseInt(fpsInput.value, 10)
+  filters.push(`fps=${fps}`)
+  const width = parseInt(widthInput.value, 10)
+  if (width > 0) {
+    // keep aspect ratio, force even dimensions for codec compatibility
+    filters.push(`scale=${width}:-2:flags=lanczos`)
+  }
+  return filters
+}
+
+function buildArgs(format, inputName, outputName) {
+  const useAlpha = FORMATS[format].supportsAlpha && alphaToggle.checked
+  const loop = loopToggle.checked
+  const quality = parseInt(qualityInput.value, 10)
+  const filters = buildVideoFilters()
+
+  if (format === "webm") {
+    // CRF: map 0-100 quality to VP9 CRF 0(best)-63(worst)
+    const crf = Math.round(63 - (quality / 100) * 53) // ~10..63
+    if (useAlpha) filters.push("format=yuva420p")
+    else filters.push("format=yuv420p")
+
+    const args = [
+      "-i", inputName,
+      "-an",
+      "-c:v", "libvpx-vp9",
+      "-pix_fmt", useAlpha ? "yuva420p" : "yuv420p",
+      "-crf", String(crf),
+      "-b:v", "0",
+      "-vf", filters.join(","),
+    ]
+    // only enable row-mt when multi-threading is available
+    if (useMultiThread) {
+      args.push("-row-mt", "1")
+    }
+    args.push(outputName)
+    return args
+  }
+
+  if (format === "webp") {
+    if (useAlpha) filters.push("format=yuva420p")
+    return [
+      "-i", inputName,
+      "-an",
+      "-vcodec", "libwebp",
+      "-lossless", "0",
+      "-q:v", String(quality),
+      "-loop", loop ? "0" : "1",
+      "-preset", "default",
+      "-vsync", "0",
+      "-vf", filters.join(","),
+      outputName,
+    ]
+  }
+
+  // gif — quality slider controls palette size (colors)
+  if (format === "gif") {
+    const colors = Math.max(8, Math.round((quality / 100) * 248) + 8) // 8..256
+    const vf =
+      `${filters.join(",")},split[s0][s1];` +
+      `[s0]palettegen=max_colors=${colors}[p];` +
+      `[s1][p]paletteuse=dither=bayer`
+    return [
+      "-i", inputName,
+      "-an",
+      "-loop", loop ? "0" : "-1",
+      "-vsync", "0",
+      "-vf", vf,
+      outputName,
+    ]
+  }
+}
+
+async function convertOne(entry, format) {
+  const fmt = FORMATS[format]
+  const baseName = entry.file.name.replace(/\.[^.]+$/, "")
+  const inputName = `in_${entry.id}.${entry.file.name.split(".").pop()}`
+  const outputName = `out_${entry.id}.${fmt.ext}`
+
+  entry.status = "processing"
+  entry.progress = 0
+  entry.error = null
+  render()
+
+  // progress handler scoped to this run
+  const onProgress = ({ progress }) => {
+    entry.progress = Math.max(0, Math.min(1, progress))
+    updateProgress(entry)
+  }
+  ffmpeg.on("progress", onProgress)
+
+  try {
+    await ffmpeg.writeFile(inputName, await fetchFile(entry.file))
+    const args = buildArgs(format, inputName, outputName)
+    console.log("[v0] ffmpeg args:", args.join(" "))
+    try {
+      await ffmpeg.exec(args)
+    } catch (execErr) {
+      // Retry WebM with VP8 if VP9 isn't available or failed in this build
+      if (format === "webm" && args.includes("libvpx-vp9")) {
+        console.log("[v0] retrying WebM with libvpx (VP8) due to exec error:", execErr)
+        const fallbackArgs = args.map((a) => (a === "libvpx-vp9" ? "libvpx" : a))
+        await ffmpeg.exec(fallbackArgs)
+      } else {
+        throw execErr
+      }
+    }
+
+    const data = await ffmpeg.readFile(outputName)
+    const blob = new Blob([data.buffer], { type: fmt.mime })
+    const url = URL.createObjectURL(blob)
+    entry.results = [{ url, name: `${baseName}.${fmt.ext}`, size: blob.size }]
+    entry.status = "done"
+    entry.progress = 1
+
+    // cleanup virtual FS
+    await ffmpeg.deleteFile(inputName).catch(() => {})
+    await ffmpeg.deleteFile(outputName).catch(() => {})
+  } catch (err) {
+    console.log("[v0] conversion error:", err)
+    entry.status = "error"
+    entry.error = "Conversion failed. The codec or source may be unsupported."
+  } finally {
+    ffmpeg.off("progress", onProgress)
+    render()
+  }
+}
+
+async function convertAll() {
+  if (isConverting) return
+  const queue = files.filter((f) => f.status !== "done")
+  if (queue.length === 0) return
+
+  isConverting = true
+  refreshControls()
+
+  // Lazily boot the engine on first conversion.
+  if (!engineReady) {
+    const ok = await loadEngine()
+    if (!ok) {
+      isConverting = false
+      refreshControls()
+      return
+    }
+  }
+
+  const format = getFormat()
+  for (const entry of queue) {
+    await convertOne(entry, format)
+  }
+
+  isConverting = false
+  refreshControls()
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+function updateProgress(entry) {
+  const bar = fileListEl.querySelector(`[data-bar="${entry.id}"]`)
+  const pct = fileListEl.querySelector(`[data-pct="${entry.id}"]`)
+  if (bar) bar.style.width = `${Math.round(entry.progress * 100)}%`
+  if (pct) pct.textContent = `${Math.round(entry.progress * 100)}%`
+}
+
+function render() {
+  emptyState.style.display = files.length ? "none" : "block"
+  clearBtn.disabled = files.length === 0 || isConverting
+
+  fileListEl.innerHTML = ""
+  for (const entry of files) {
+    const li = document.createElement("li")
+    li.className = "file"
+
+    const badgeState =
+      entry.status === "done" ? "done" : entry.status === "error" ? "error" : entry.status === "processing" ? "processing" : "queued"
+    const badgeText =
+      entry.status === "done" ? "Done" : entry.status === "error" ? "Error" : entry.status === "processing" ? "Working" : "Queued"
+
+    li.innerHTML = `
+      <div class="file__top">
+        <span class="file__name" title="${escapeHtml(entry.file.name)}">${escapeHtml(entry.file.name)}</span>
+        <span class="file__meta">${formatBytes(entry.file.size)}</span>
+        <button class="file__remove" type="button" aria-label="Remove ${escapeHtml(entry.file.name)}" data-remove="${entry.id}">&times;</button>
+      </div>
+      <div class="file__status">
+        <span class="file__badge" data-state="${badgeState}">${badgeText}</span>
+        <span data-pct="${entry.id}">${Math.round(entry.progress * 100)}%</span>
+      </div>
+      <div class="progress"><div class="progress__bar" data-bar="${entry.id}" style="width:${Math.round(entry.progress * 100)}%"></div></div>
+    `
+
+    if (entry.results && entry.results.length) {
+      const result = document.createElement("div")
+      result.className = "file__result"
+      for (const r of entry.results) {
+        const a = document.createElement("a")
+        a.className = "btn btn--download"
+        a.href = r.url
+        a.download = r.name
+        a.innerHTML = `&darr; ${escapeHtml(r.name)} <span style="opacity:.7">(${formatBytes(r.size)})</span>`
+        result.appendChild(a)
+      }
+      li.appendChild(result)
+    }
+
+    if (entry.status === "error" && entry.error) {
+      const errEl = document.createElement("div")
+      errEl.className = "file__error"
+      errEl.textContent = entry.error
+      li.appendChild(errEl)
+    }
+
+    fileListEl.appendChild(li)
+  }
+
+  refreshControls()
+}
+
+function refreshControls() {
+  const pending = files.some((f) => f.status !== "done")
+  convertBtn.disabled = isConverting || files.length === 0 || !pending
+  convertBtn.textContent = engineLoading
+    ? "Loading engine…"
+    : isConverting
+    ? "Converting…"
+    : "Convert all files"
+  clearBtn.disabled = files.length === 0 || isConverting
+  // enable download-all when there is at least one completed result and not converting
+  const anyResults = files.some((f) => f.results && f.results.length)
+  if (downloadAllBtn) downloadAllBtn.disabled = isConverting || !anyResults
+
+  // disable settings while converting
+  ;[alphaToggle, loopToggle, fpsInput, qualityInput, widthInput].forEach((el) => {
+    el.disabled = isConverting
+  })
+  document.querySelectorAll('input[name="format"]').forEach((el) => (el.disabled = isConverting))
+}
+
+function escapeHtml(str) {
+  return str.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Settings UI sync
+// ---------------------------------------------------------------------------
+function syncFormatUI() {
+  const fmt = FORMATS[getFormat()]
+  formatDesc.textContent = fmt.desc
+  qualityLabel.textContent = fmt.qualityLabel
+  alphaNote.textContent = fmt.alphaNote
+
+  // alpha availability
+  alphaToggle.disabled = !fmt.supportsAlpha || isConverting
+  if (!fmt.supportsAlpha) alphaToggle.checked = false
+
+  // loop applies to webp/gif only
+  const loopWrap = loopToggle.closest(".field")
+  loopWrap.style.display = getFormat() === "webm" ? "none" : "block"
+
+  syncQualityOut()
+}
+
+function syncQualityOut() {
+  const fmt = getFormat()
+  const q = parseInt(qualityInput.value, 10)
+  if (fmt === "gif") {
+    const colors = Math.max(8, Math.round((q / 100) * 248) + 8)
+    qualityOut.textContent = `${colors} colors`
+  } else {
+    qualityOut.textContent = `${q}/100`
+  }
+}
+
+function syncFps() {
+  fpsOut.textContent = `${fpsInput.value} fps`
+}
+
+function syncWidth() {
+  const w = parseInt(widthInput.value, 10)
+  widthOut.textContent = w === 0 ? "Original" : `${w}px`
+}
+
+// ---------------------------------------------------------------------------
+// Event wiring
+// ---------------------------------------------------------------------------
+dropzone.addEventListener("click", () => fileInput.click())
+dropzone.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault()
+    fileInput.click()
+  }
+})
+fileInput.addEventListener("change", (e) => {
+  addFiles(e.target.files)
+  fileInput.value = ""
+})
+
+;["dragenter", "dragover"].forEach((evt) =>
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault()
+    dropzone.classList.add("is-dragover")
+  })
+)
+;["dragleave", "drop"].forEach((evt) =>
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault()
+    if (evt === "dragleave" && dropzone.contains(e.relatedTarget)) return
+    dropzone.classList.remove("is-dragover")
+  })
+)
+dropzone.addEventListener("drop", (e) => {
+  if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files)
+})
+
+fileListEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-remove]")
+  if (btn) removeFile(Number(btn.dataset.remove))
+})
+
+clearBtn.addEventListener("click", clearAll)
+convertBtn.addEventListener("click", convertAll)
+
+if (downloadAllBtn) {
+  downloadAllBtn.addEventListener("click", async () => {
+    // collect all result entries
+    const zip = new JSZip()
+    let added = 0
+    for (const entry of files) {
+      if (!entry.results || !entry.results.length) continue
+      for (const r of entry.results) {
+        try {
+          const resp = await fetch(r.url)
+          const blob = await resp.blob()
+          zip.file(r.name, blob)
+          added++
+        } catch (e) {
+          console.log('[v0] failed to fetch result for zip', r, e)
+        }
+      }
+    }
+    if (added === 0) return flashDropzone('No files ready to download')
+    const content = await zip.generateAsync({ type: 'blob' })
+    const url = URL.createObjectURL(content)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'converted-results.zip'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 10000)
+  })
+}
+
+document.querySelectorAll('input[name="format"]').forEach((el) =>
+  el.addEventListener("change", () => {
+    syncFormatUI()
+    refreshControls()
+  })
+)
+qualityInput.addEventListener("input", syncQualityOut)
+fpsInput.addEventListener("input", syncFps)
+widthInput.addEventListener("input", syncWidth)
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+syncFormatUI()
+syncFps()
+syncWidth()
+render()
+setEngineStatus("idle", "Engine loads automatically the first time you convert.")
+
+// Optionally preload the engine on page load (toggle via EAGER_LOAD)
+if (EAGER_LOAD) {
+  loadEngine().catch((err) => console.log('[v0] eager load failed', err))
+}

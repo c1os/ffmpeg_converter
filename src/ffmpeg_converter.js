@@ -1,22 +1,98 @@
 let ffmpeg = null
-let _fetchFile = null
 let loaded = false
+
+// IndexedDB helpers for storing uploads and outputs
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('ffmpeg-converter', 1)
+    req.onupgradeneeded = () => {
+      const db = req.result
+      if (!db.objectStoreNames.contains('uploads')) db.createObjectStore('uploads')
+      if (!db.objectStoreNames.contains('outputs')) db.createObjectStore('outputs')
+    }
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function saveFileToDB(name, file) {
+  function readFileAsArrayBuffer(f) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(reader.result)
+      reader.onerror = () => reject(reader.error)
+      reader.readAsArrayBuffer(f)
+    })
+  }
+
+  const data = await readFileAsArrayBuffer(file)
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('uploads', 'readwrite')
+    const store = tx.objectStore('uploads')
+    const req = store.put(data, name)
+    req.onsuccess = () => resolve()
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function getFileFromDB(name) {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('uploads', 'readonly')
+    const store = tx.objectStore('uploads')
+    const req = store.get(name)
+    req.onsuccess = () => {
+      if (req.result) resolve(new Uint8Array(req.result))
+      else reject(new Error('file not found in DB: ' + name))
+    }
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function saveOutputToDB(name, uint8array) {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('outputs', 'readwrite')
+    const store = tx.objectStore('outputs')
+    store.put(uint8array, name)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+async function listOutputsFromDB() {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('outputs', 'readonly')
+    const store = tx.objectStore('outputs')
+    const req = store.getAllKeys()
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
 
 async function loadFFmpegModule() {
   try {
     const { FFmpeg } = await import('@ffmpeg/ffmpeg')
-    const { fetchFile } = await import('@ffmpeg/util')
-    
-    _fetchFile = fetchFile
+    const { toBlobURL } = await import('@ffmpeg/util')
+
     ffmpeg = new FFmpeg()
+
+    // 1. Point to the multi-threaded core pool (-mt)
+    const baseURL = 'https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm'
     
-    // Modern logging syntax
-    ffmpeg.on('log', ({ message }) => {
-      console.log(message)
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      // 2. CRITICAL: Provide the worker script so WebAssembly can split memory allocations safely
+      workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
     })
-    
+
+    loaded = true
   } catch (err) {
     console.error('loadFFmpegModule error:', err)
+    loaded = false
     throw new Error('Failed to load @ffmpeg/ffmpeg: ' + err.message)
   }
 }
@@ -37,15 +113,12 @@ function mkOption(label, id, type = 'text', attrs = {}) {
 }
 
 export async function setupConverter(root) {
-  // Import CSS
   await import('./main.css')
 
   const container = document.createElement('div')
   container.className = 'converter-container'
-  
   container.innerHTML = `<h1>🎬 Universal Video Converter</h1>`
 
-  // ===== FILE DROP ZONE =====
   const dropZone = document.createElement('div')
   dropZone.className = 'drop-zone'
   dropZone.innerHTML = `
@@ -67,13 +140,12 @@ export async function setupConverter(root) {
 
   container.appendChild(dropZone)
 
-  // ===== FORMAT SECTION =====
   const formatSection = document.createElement('div')
   formatSection.className = 'section'
   formatSection.innerHTML = '<label class="section-title">Export Format</label>'
   
   const formatSelect = document.createElement('select')
-  const formats = ['WebM (VP9)','MP4 (H264)','GIF','MOV (ProRes 4444)']
+  const formats = ['WebM (VP9)','WebP (Animated)','GIF']
   for (const f of formats) {
     const o = document.createElement('option')
     o.value = f
@@ -83,7 +155,6 @@ export async function setupConverter(root) {
   formatSection.appendChild(formatSelect)
   container.appendChild(formatSection)
 
-  // ===== PRESET SECTION =====
   const presetSection = document.createElement('div')
   presetSection.className = 'section'
   presetSection.innerHTML = '<label class="section-title">Quality Preset</label>'
@@ -105,7 +176,6 @@ export async function setupConverter(root) {
   presetSection.appendChild(presetWrap)
   container.appendChild(presetSection)
 
-  // ===== OPTIONS SECTION =====
   const optionsSection = document.createElement('div')
   optionsSection.className = 'section'
   
@@ -120,13 +190,11 @@ export async function setupConverter(root) {
 
   container.appendChild(optionsSection)
 
-  // ===== CONVERT BUTTON =====
   const convertButton = document.createElement('button')
   convertButton.className = 'convert-button'
   convertButton.textContent = '▶ Convert'
   container.appendChild(convertButton)
 
-  // ===== LOG AREA =====
   const logContainer = document.createElement('div')
   logContainer.className = 'log-container'
   logContainer.innerHTML = '<label class="log-label">Conversion Log</label>'
@@ -138,14 +206,12 @@ export async function setupConverter(root) {
   logContainer.appendChild(log)
   container.appendChild(logContainer)
 
-  // ===== OUTPUT LINKS =====
   const outputLinks = document.createElement('div')
   outputLinks.className = 'output-links'
   container.appendChild(outputLinks)
 
   root.appendChild(container)
 
-  // ===== EVENT HANDLERS =====
   function logLine(s) {
     log.value += s + '\n'
     log.scrollTop = log.scrollHeight
@@ -171,7 +237,6 @@ export async function setupConverter(root) {
     }
   }
 
-  // ===== DRAG AND DROP =====
   dropZone.addEventListener('click', () => fileInput.click())
 
   dropZone.addEventListener('dragover', (e) => {
@@ -196,9 +261,15 @@ export async function setupConverter(root) {
     const files = Array.from(fileInput.files || [])
     if (files.length > 0) {
       logLine(`\n📂 ${files.length} file(s) selected:`)
-      files.forEach(file => {
+      files.forEach(async (file) => {
         const sizeInMB = (file.size / (1024 * 1024)).toFixed(2)
         logLine(`  ✓ ${file.name} (${sizeInMB} MB)`)
+        try {
+          await saveFileToDB(file.name, file)
+          logLine(`    → saved ${file.name} to browser storage`)
+        } catch (e) {
+          logLine(`    ✗ failed saving ${file.name}: ${e.message}`)
+        }
       })
     }
   })
@@ -206,22 +277,12 @@ export async function setupConverter(root) {
   async function ensureLoaded() {
     if (!loaded) {
       logLine('Loading ffmpeg.wasm...')
-      if (!ffmpeg) {
-        try {
-          await loadFFmpegModule()
-        } catch (e) {
-          logLine('✗ Error loading ffmpeg module: ' + e.message)
-          throw e
-        }
-      }
-      
       try {
-        await ffmpeg.load()
+        await loadFFmpegModule()
         ffmpeg.on('log', ({ message }) => logLine(message))
-        loaded = true
         logLine('✓ ffmpeg loaded.')
       } catch (e) {
-        logLine('✗ Error loading ffmpeg core: ' + e.message)
+        logLine('✗ Error loading ffmpeg: ' + e.message)
         throw e
       }
     }
@@ -235,10 +296,9 @@ export async function setupConverter(root) {
     }
 
     await ensureLoaded()
-
     outputLinks.innerHTML = ''
 
-    const cpuUsedMap = { 'Fast': '6', 'Balanced': '4', 'High Quality': '2' }
+    const cpuUsedMap = { 'Fast': '8', 'Balanced': '4', 'High Quality': '1' }
     const preset = document.querySelector('input[name="preset"]:checked').value
     const cpuUsed = cpuUsedMap[preset]
     const crf = crfEl.value || 28
@@ -253,9 +313,7 @@ export async function setupConverter(root) {
       logLine('\nStarting: ' + name)
 
       try {
-        const data = await _fetchFile(file)
-        
-        // FIXED: Modern writeFile API
+        const data = await getFileFromDB(name)
         await ffmpeg.writeFile(inName, data)
 
         let extension = '.webm'
@@ -265,80 +323,84 @@ export async function setupConverter(root) {
         if (outputFormat === 'WebM (VP9)') {
           extension = '.webm'
           suffix = '_vp9'
-        } else if (outputFormat === 'MP4 (H264)') {
-          extension = '.mp4'
-          suffix = '_h264'
+        } else if (outputFormat === 'WebP (Animated)') {
+          extension = '.webp'
+          suffix = '_webp'
         } else if (outputFormat === 'GIF') {
           extension = '.gif'
           suffix = '_gif'
-        } else {
-          extension = '.mov'
-          suffix = '_prores'
         }
 
         const outName = `${base}${suffix}${extension}`
         const cmd = ['-y', '-i', inName]
 
-        // Video codec and options
         if (outputFormat === 'WebM (VP9)') {
-          cmd.push('-c:v','libvpx-vp9','-row-mt','1','-threads','16','-crf',String(crf),'-b:v','0','-deadline','good','-cpu-used',cpuUsed)
-          if (preserveAlpha) cmd.push('-pix_fmt','yuva420p')
-          else cmd.push('-pix_fmt','yuv420p')
-        } else if (outputFormat === 'MP4 (H264)') {
-          cmd.push('-c:v','libx264','-crf',String(crf),'-pix_fmt','yuv420p')
+          // FIX: Removed '-threads 16' and '-row-mt 1' to avoid breaking the sequential WASM module core structure
+          cmd.push('-c:v', 'libvpx-vp9', '-crf', String(crf), '-b:v', '0', '-deadline', 'good', '-cpu-used', cpuUsed)
+          if (preserveAlpha) cmd.push('-pix_fmt', 'yuva420p')
+          else cmd.push('-pix_fmt', 'yuv420p')
+        } else if (outputFormat === 'WebP (Animated)') {
+          cmd.push('-c:v', 'libwebp', '-lossless', '0', '-qscale', String(Math.max(10, Math.min(100, 100 - crf))), '-preset', 'default', '-loop', '0')
         } else if (outputFormat === 'GIF') {
-          cmd.push('-vf','fps=15')
-        } else if (outputFormat === 'MOV (ProRes 4444)') {
-          cmd.push('-c:v','prores_ks','-profile:v','4444')
-          if (preserveAlpha) cmd.push('-pix_fmt','yuva444p10le')
-          else cmd.push('-pix_fmt','yuv422p10le')
+          cmd.push('-vf', 'fps=15,scale=512:-1:flags=lanczos')
         }
 
-        // Audio
-        if (keepAudio) {
-          if (outputFormat === 'WebM (VP9)') cmd.push('-c:a','libopus')
-          else if (outputFormat === 'MP4 (H264)') cmd.push('-c:a','aac')
-          else if (outputFormat === 'MOV (ProRes 4444)') cmd.push('-c:a','pcm_s16le')
+        if (keepAudio && outputFormat === 'WebM (VP9)') {
+          cmd.push('-c:a', 'libopus')
         } else {
           cmd.push('-an')
         }
 
         cmd.push(outName)
-
         logLine('Running ffmpeg: ' + cmd.join(' '))
 
+        let processingSuccess = false
         try {
-          // FIXED: Modern exec API (Passing the whole array directly)
-          await ffmpeg.exec(cmd)
+          // modern API .exec returns exit code 0 if successful
+          const exitCode = await ffmpeg.exec(cmd)
+          if (exitCode === 0) {
+            processingSuccess = true
+          } else {
+            logLine(`✗ ffmpeg finished with errors. Exit code: ${exitCode}`)
+          }
         } catch (e) {
-          logLine('ffmpeg execution error: ' + e.message)
+          logLine('✗ ffmpeg runtime execution crash: ' + (e.message || String(e)))
         }
 
-        try {
-          // FIXED: Modern readFile API
-          const outData = await ffmpeg.readFile(outName)
-          const blob = new Blob([outData.buffer], { type: 'application/octet-stream' })
-          const url = URL.createObjectURL(blob)
-          const a = document.createElement('a')
-          a.href = url
-          a.download = outName
-          a.textContent = `Download ${outName}`
-          a.style.display = 'block'
-          outputLinks.appendChild(a)
-          logLine(`✓ ${name} -> ${outName}`)
-        } catch (e) {
-          logLine('✗ Failed to read output: ' + String(e))
+        // Guard Check: Don't read or process missing/broken files
+        if (processingSuccess) {
+          try {
+            const outData = await ffmpeg.readFile(outName)
+            
+            if (outData && outData.length > 0) {
+              const blob = new Blob([outData.buffer || outData], { type: 'application/octet-stream' })
+              
+              try {
+                await saveOutputToDB(outName, outData)
+                logLine(`    → saved output ${outName} to browser storage`)
+              } catch (e) {
+                logLine(`    ✗ failed saving output ${outName}: ${e.message}`)
+              }
+              
+              const url = URL.createObjectURL(blob)
+              const a = document.createElement('a')
+              a.href = url
+              a.download = outName
+              a.textContent = `Download ${outName}`
+              a.style.display = 'block'
+              outputLinks.appendChild(a)
+              logLine(`✓ ${name} -> ${outName} (${(outData.length / (1024 * 1024)).toFixed(2)} MB)`)
+            } else {
+              logLine('✗ Output generated successfully but the written binary block contains 0 bytes.')
+            }
+          } catch (e) {
+            logLine('✗ Failed to read output file: ' + String(e))
+          }
         }
 
-        // Cleanup
-        try {
-          // FIXED: Modern deleteFile API
-          await ffmpeg.deleteFile(inName)
-        } catch {}
-        try {
-          // FIXED: Modern deleteFile API
-          await ffmpeg.deleteFile(outName)
-        } catch {}
+        // Cleanup virtual environment files
+        try { await ffmpeg.deleteFile(inName) } catch {}
+        try { await ffmpeg.deleteFile(outName) } catch {}
 
       } catch (err) {
         logLine('✗ Error processing ' + name + ': ' + String(err))
