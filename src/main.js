@@ -55,6 +55,7 @@ const fileInput = $("#file-input")
 const fileListEl = $("#filelist")
 const emptyState = $("#empty-state")
 const clearBtn = $("#clear-btn")
+const clearStorageBtn = $("#clear-storage-btn")
 const convertBtn = $("#convert-btn")
 const statusDot = $("#engine-status .engine-status__dot")
 const statusText = $("#engine-status-text")
@@ -110,10 +111,10 @@ async function loadEngine() {
 
   enginePromise = (async () => {
     const CORE_BASE = useMultiThread ? CORE_MULTI : CORE_SINGLE
-    console.log("[v0] ffmpeg core:", useMultiThread ? "core-mt (multi-thread)" : "core (single-thread)")
+    console.log("[W&F] ffmpeg core:", useMultiThread ? "core-mt (multi-thread)" : "core (single-thread)")
 
     ffmpeg = new FFmpeg()
-    ffmpeg.on("log", ({ message }) => console.log("[v0][ffmpeg]", message))
+    ffmpeg.on("log", ({ message }) => console.log("[W&F][ffmpeg]", message))
 
     if (useMultiThread) {
       await ffmpeg.load({
@@ -138,7 +139,7 @@ async function loadEngine() {
   try {
     return await enginePromise
   } catch (err) {
-    console.log("[v0] engine load failed:", err)
+    console.log("[W&F] engine load failed:", err)
     engineLoading = false
     enginePromise = null
     setEngineStatus("error", "Couldn't load the engine. Check your connection and try Convert again.")
@@ -191,6 +192,44 @@ function clearAll() {
   files.forEach((f) => f.results.forEach((r) => URL.revokeObjectURL(r.url)))
   files.length = 0
   render()
+  // Also wipe any leftover storage so memory doesn't accumulate
+  clearStorage({ silent: true })
+}
+
+/**
+ * Purges all browser storage used by this app:
+ *  1. The "ffmpeg-converter" IndexedDB (written by the legacy ffmpeg_converter.js code)
+ *  2. The ffmpeg WASM worker — terminate() kills the Web Worker and frees WASM heap memory.
+ *     The engine state is reset so the next conversion re-initialises cleanly.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.silent=false]  Skip the flash message (used when called from clearAll)
+ */
+async function clearStorage({ silent = false } = {}) {
+  // 1. Terminate the ffmpeg worker and reset engine state
+  if (ffmpeg) {
+    try { ffmpeg.terminate() } catch { }
+    ffmpeg = null
+  }
+  engineReady = false
+  engineLoading = false
+  enginePromise = null
+  setEngineStatus("idle", "Engine loads automatically the first time you convert.")
+  refreshControls()
+
+  // 2. Delete the legacy IndexedDB ("ffmpeg-converter") if it exists
+  await new Promise((resolve) => {
+    try {
+      const req = indexedDB.deleteDatabase("ffmpeg-converter")
+      req.onsuccess = resolve
+      req.onerror = resolve   // resolve even on error — non-fatal
+      req.onblocked = resolve
+    } catch {
+      resolve()
+    }
+  })
+
+  if (!silent) flashDropzone("Browser storage cleared ✓")
 }
 
 function flashDropzone(msg) {
@@ -228,24 +267,24 @@ function buildArgs(format, inputName, outputName) {
   const filters = buildVideoFilters()
 
   if (format === "webm") {
-    // CRF: map 0-100 quality to VP9 CRF 0(best)-63(worst)
-    const crf = Math.round(63 - (quality / 100) * 53) // ~10..63
-    if (useAlpha) filters.push("format=yuva420p")
-    else filters.push("format=yuv420p")
+    const crf = Math.round(63 - (quality / 100) * 53)
 
     const args = [
       "-i", inputName,
       "-an",
       "-c:v", "libvpx-vp9",
-      "-pix_fmt", useAlpha ? "yuva420p" : "yuv420p",
       "-crf", String(crf),
       "-b:v", "0",
-      "-vf", filters.join(","),
+      "-deadline", "realtime",
+      "-cpu-used", "8",
+      "-tile-columns", "0",
+      "-frame-parallel", "0",
+      "-auto-alt-ref", "0",
+      "-vf", useAlpha
+        ? `${filters.join(",")},format=yuva420p`
+        : `${filters.join(",")},format=yuv420p`,
     ]
-    // only enable row-mt when multi-threading is available
-    if (useMultiThread) {
-      args.push("-row-mt", "1")
-    }
+    if (useMultiThread) args.push("-row-mt", "1")
     args.push(outputName)
     return args
   }
@@ -255,20 +294,18 @@ function buildArgs(format, inputName, outputName) {
     return [
       "-i", inputName,
       "-an",
-      "-vcodec", "libwebp",
+      "-vcodec", "libwebp_anim",
       "-lossless", "0",
       "-q:v", String(quality),
       "-loop", loop ? "0" : "1",
       "-preset", "default",
-      "-vsync", "0",
       "-vf", filters.join(","),
       outputName,
     ]
   }
 
-  // gif — quality slider controls palette size (colors)
   if (format === "gif") {
-    const colors = Math.max(8, Math.round((quality / 100) * 248) + 8) // 8..256
+    const colors = Math.max(8, Math.round((quality / 100) * 248) + 8)
     const vf =
       `${filters.join(",")},split[s0][s1];` +
       `[s0]palettegen=max_colors=${colors}[p];` +
@@ -305,13 +342,13 @@ async function convertOne(entry, format) {
   try {
     await ffmpeg.writeFile(inputName, await fetchFile(entry.file))
     const args = buildArgs(format, inputName, outputName)
-    console.log("[v0] ffmpeg args:", args.join(" "))
+    console.log("[W&F] ffmpeg args:", args.join(" "))
     try {
       await ffmpeg.exec(args)
     } catch (execErr) {
       // Retry WebM with VP8 if VP9 isn't available or failed in this build
       if (format === "webm" && args.includes("libvpx-vp9")) {
-        console.log("[v0] retrying WebM with libvpx (VP8) due to exec error:", execErr)
+        console.log("[W&F] retrying WebM with libvpx (VP8) due to exec error:", execErr)
         const fallbackArgs = args.map((a) => (a === "libvpx-vp9" ? "libvpx" : a))
         await ffmpeg.exec(fallbackArgs)
       } else {
@@ -327,10 +364,10 @@ async function convertOne(entry, format) {
     entry.progress = 1
 
     // cleanup virtual FS
-    await ffmpeg.deleteFile(inputName).catch(() => {})
-    await ffmpeg.deleteFile(outputName).catch(() => {})
+    await ffmpeg.deleteFile(inputName).catch(() => { })
+    await ffmpeg.deleteFile(outputName).catch(() => { })
   } catch (err) {
-    console.log("[v0] conversion error:", err)
+    console.log("[W&F] conversion error:", err)
     entry.status = "error"
     entry.error = "Conversion failed. The codec or source may be unsupported."
   } finally {
@@ -341,6 +378,7 @@ async function convertOne(entry, format) {
 
 async function convertAll() {
   if (isConverting) return
+  // FIX: also re-queue files that previously errored so retries work
   const queue = files.filter((f) => f.status !== "done")
   if (queue.length === 0) return
 
@@ -358,6 +396,8 @@ async function convertAll() {
   }
 
   const format = getFormat()
+  // FIX: process sequentially — ffmpeg.wasm can only run one exec() at a time.
+  // forEach(async) would fire them all in parallel, causing the last file to hang.
   for (const entry of queue) {
     await convertOne(entry, format)
   }
@@ -372,8 +412,25 @@ async function convertAll() {
 function updateProgress(entry) {
   const bar = fileListEl.querySelector(`[data-bar="${entry.id}"]`)
   const pct = fileListEl.querySelector(`[data-pct="${entry.id}"]`)
-  if (bar) bar.style.width = `${Math.round(entry.progress * 100)}%`
-  if (pct) pct.textContent = `${Math.round(entry.progress * 100)}%`
+  const badge = fileListEl.querySelector(`[data-badge="${entry.id}"]`)
+
+  const isProcessing = entry.status === "processing"
+
+  // Cap bar at 99% while still processing — ffmpeg's progress event fires at 1.0
+  // before exec() resolves (output is still being muxed/flushed to the virtual FS).
+  // We only show 100% once the file is truly done.
+  const rawPct = Math.round(entry.progress * 100)
+  const displayPct = isProcessing ? Math.min(rawPct, 99) : rawPct
+
+  if (bar) bar.style.width = `${displayPct}%`
+  if (pct) pct.textContent = `${displayPct}%`
+
+  // When progress hits 100% but exec() hasn't returned, switch the badge to
+  // "Finalizing…" so the user knows it's wrapping up — not frozen.
+  if (badge && isProcessing && entry.progress >= 1) {
+    badge.textContent = "Finalizing…"
+    badge.dataset.state = "finalizing"
+  }
 }
 
 function render() {
@@ -390,6 +447,10 @@ function render() {
     const badgeText =
       entry.status === "done" ? "Done" : entry.status === "error" ? "Error" : entry.status === "processing" ? "Working" : "Queued"
 
+    // While processing, cap the displayed % at 99 so it never shows 100% while still "Working"
+    const isProcessing = entry.status === "processing"
+    const displayPct = isProcessing ? Math.min(Math.round(entry.progress * 100), 99) : Math.round(entry.progress * 100)
+
     li.innerHTML = `
       <div class="file__top">
         <span class="file__name" title="${escapeHtml(entry.file.name)}">${escapeHtml(entry.file.name)}</span>
@@ -397,10 +458,10 @@ function render() {
         <button class="file__remove" type="button" aria-label="Remove ${escapeHtml(entry.file.name)}" data-remove="${entry.id}">&times;</button>
       </div>
       <div class="file__status">
-        <span class="file__badge" data-state="${badgeState}">${badgeText}</span>
-        <span data-pct="${entry.id}">${Math.round(entry.progress * 100)}%</span>
+        <span class="file__badge" data-state="${badgeState}" data-badge="${entry.id}">${badgeText}</span>
+        <span data-pct="${entry.id}">${displayPct}%</span>
       </div>
-      <div class="progress"><div class="progress__bar" data-bar="${entry.id}" style="width:${Math.round(entry.progress * 100)}%"></div></div>
+      <div class="progress"><div class="progress__bar" data-bar="${entry.id}" style="width:${displayPct}%"></div></div>
     `
 
     if (entry.results && entry.results.length) {
@@ -436,17 +497,17 @@ function refreshControls() {
   convertBtn.textContent = engineLoading
     ? "Loading engine…"
     : isConverting
-    ? "Converting…"
-    : "Convert all files"
+      ? "Converting…"
+      : "Convert all files"
   clearBtn.disabled = files.length === 0 || isConverting
   // enable download-all when there is at least one completed result and not converting
   const anyResults = files.some((f) => f.results && f.results.length)
   if (downloadAllBtn) downloadAllBtn.disabled = isConverting || !anyResults
 
-  // disable settings while converting
-  ;[alphaToggle, loopToggle, fpsInput, qualityInput, widthInput].forEach((el) => {
-    el.disabled = isConverting
-  })
+    // disable settings while converting
+    ;[alphaToggle, loopToggle, fpsInput, qualityInput, widthInput].forEach((el) => {
+      el.disabled = isConverting
+    })
   document.querySelectorAll('input[name="format"]').forEach((el) => (el.disabled = isConverting))
 }
 
@@ -508,22 +569,23 @@ dropzone.addEventListener("keydown", (e) => {
 })
 fileInput.addEventListener("change", (e) => {
   addFiles(e.target.files)
+  // FIX: reset value so the same file(s) can be re-selected later
   fileInput.value = ""
 })
 
-;["dragenter", "dragover"].forEach((evt) =>
-  dropzone.addEventListener(evt, (e) => {
-    e.preventDefault()
-    dropzone.classList.add("is-dragover")
-  })
-)
-;["dragleave", "drop"].forEach((evt) =>
-  dropzone.addEventListener(evt, (e) => {
-    e.preventDefault()
-    if (evt === "dragleave" && dropzone.contains(e.relatedTarget)) return
-    dropzone.classList.remove("is-dragover")
-  })
-)
+  ;["dragenter", "dragover"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault()
+      dropzone.classList.add("is-dragover")
+    })
+  )
+  ;["dragleave", "drop"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault()
+      if (evt === "dragleave" && dropzone.contains(e.relatedTarget)) return
+      dropzone.classList.remove("is-dragover")
+    })
+  )
 dropzone.addEventListener("drop", (e) => {
   if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files)
 })
@@ -534,6 +596,7 @@ fileListEl.addEventListener("click", (e) => {
 })
 
 clearBtn.addEventListener("click", clearAll)
+if (clearStorageBtn) clearStorageBtn.addEventListener("click", () => clearStorage())
 convertBtn.addEventListener("click", convertAll)
 
 if (downloadAllBtn) {
@@ -550,7 +613,7 @@ if (downloadAllBtn) {
           zip.file(r.name, blob)
           added++
         } catch (e) {
-          console.log('[v0] failed to fetch result for zip', r, e)
+          console.log('[W&F] failed to fetch result for zip', r, e)
         }
       }
     }
@@ -588,5 +651,5 @@ setEngineStatus("idle", "Engine loads automatically the first time you convert."
 
 // Optionally preload the engine on page load (toggle via EAGER_LOAD)
 if (EAGER_LOAD) {
-  loadEngine().catch((err) => console.log('[v0] eager load failed', err))
+  loadEngine().catch((err) => console.log('[W&F] eager load failed', err))
 }
